@@ -1,0 +1,305 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import pandas as pd
+import sqlite3
+import os
+from decimal import Decimal
+
+app = Flask(__name__)
+CORS(app)
+
+# Initialize database
+def init_db():
+    conn = sqlite3.connect('reconciliation.db')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS internal_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reference_number TEXT NOT NULL,
+            amount REAL,
+            status TEXT DEFAULT 'unmatched'
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS processor_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            processor_name TEXT,
+            reference_number TEXT NOT NULL,
+            amount REAL,
+            status TEXT DEFAULT 'unmatched'
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+@app.route('/')
+def home():
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Reconciliation Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; }
+            .card { background: white; padding: 20px; margin: 15px 0; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            button { background: #007bff; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
+            input[type="file"], input[type="text"] { padding: 10px; margin: 5px; border: 1px solid #ddd; border-radius: 5px; width: 200px; }
+            table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+            th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+            th { background: #f8f9fa; }
+            .success { color: green; }
+            .error { color: red; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔄 Reconciliation Dashboard</h1>
+            
+            <div class="card">
+                <h3>1. Upload Internal Data</h3>
+                <input type="file" id="internalFile" accept=".csv">
+                <button onclick="uploadInternal()">Upload Internal Data</button>
+                <div id="internalMessage"></div>
+            </div>
+
+            <div class="card">
+                <h3>2. Upload Processor Data</h3>
+                <input type="file" id="processorFile" accept=".csv">
+                <input type="text" id="processorName" placeholder="Processor name">
+                <button onclick="uploadProcessor()">Upload Processor Data</button>
+                <div id="processorMessage"></div>
+            </div>
+
+            <div class="card">
+                <h3>3. Run Reconciliation</h3>
+                <button onclick="runReconciliation()">Run Matching</button>
+                <div id="results">
+                    <h4>Matched Transactions:</h4>
+                    <div id="matchResults"></div>
+                    
+                    <h4>Summary:</h4>
+                    <div id="summaryResults"></div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            async function uploadInternal() {
+                const fileInput = document.getElementById('internalFile');
+                const messageDiv = document.getElementById('internalMessage');
+                
+                if (!fileInput.files[0]) {
+                    messageDiv.innerHTML = '<span class="error">Please select a file</span>';
+                    return;
+                }
+
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+
+                try {
+                    const response = await fetch('/api/upload/internal', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const result = await response.json();
+                    messageDiv.innerHTML = `<span class="success">${result.message}</span>`;
+                } catch (error) {
+                    messageDiv.innerHTML = `<span class="error">Upload failed: ${error}</span>`;
+                }
+            }
+
+            async function uploadProcessor() {
+                const fileInput = document.getElementById('processorFile');
+                const processorName = document.getElementById('processorName').value;
+                const messageDiv = document.getElementById('processorMessage');
+                
+                if (!fileInput.files[0]) {
+                    messageDiv.innerHTML = '<span class="error">Please select a file</span>';
+                    return;
+                }
+                if (!processorName) {
+                    messageDiv.innerHTML = '<span class="error">Please enter processor name</span>';
+                    return;
+                }
+
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                formData.append('processor_name', processorName);
+
+                try {
+                    const response = await fetch('/api/upload/processor', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const result = await response.json();
+                    messageDiv.innerHTML = `<span class="success">${result.message}</span>`;
+                } catch (error) {
+                    messageDiv.innerHTML = `<span class="error">Upload failed: ${error}</span>`;
+                }
+            }
+
+            async function runReconciliation() {
+                const resultsDiv = document.getElementById('matchResults');
+                const summaryDiv = document.getElementById('summaryResults');
+                
+                resultsDiv.innerHTML = 'Running reconciliation...';
+                
+                try {
+                    const response = await fetch('/api/reconcile', { method: 'POST' });
+                    const data = await response.json();
+                    
+                    // Display matches
+                    if (data.matches && data.matches.length > 0) {
+                        let html = '<table><tr><th>Reference</th><th>Internal Amount</th><th>Processor Amount</th><th>Processor</th></tr>';
+                        data.matches.forEach(match => {
+                            html += `<tr>
+                                <td>${match.reference}</td>
+                                <td>${match.internal_amount}</td>
+                                <td>${match.processor_amount}</td>
+                                <td>${match.processor}</td>
+                            </tr>`;
+                        });
+                        html += '</table>';
+                        resultsDiv.innerHTML = html;
+                    } else {
+                        resultsDiv.innerHTML = '<p>No matches found</p>';
+                    }
+                    
+                    // Display summary
+                    summaryDiv.innerHTML = `
+                        <p><strong>Total Matches:</strong> ${data.matches ? data.matches.length : 0}</p>
+                        <p><strong>Internal Records:</strong> ${data.summary?.internal_count || 0}</p>
+                        <p><strong>Processor Records:</strong> ${data.summary?.processor_count || 0}</p>
+                    `;
+                    
+                } catch (error) {
+                    resultsDiv.innerHTML = `<span class="error">Error: ${error}</span>`;
+                }
+            }
+        </script>
+    </body>
+    </html>
+    '''
+
+@app.route('/api/upload/internal', methods=['POST'])
+def upload_internal():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    try:
+        # Read the file
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file)
+        else:
+            return jsonify({'error': 'Only CSV files supported'}), 400
+        
+        # Validate required columns
+        if 'reference_number' not in df.columns or 'amount' not in df.columns:
+            return jsonify({'error': 'CSV must contain reference_number and amount columns'}), 400
+        
+        # Save to database
+        conn = sqlite3.connect('reconciliation.db')
+        for _, row in df.iterrows():
+            conn.execute(
+                'INSERT OR REPLACE INTO internal_transactions (reference_number, amount) VALUES (?, ?)',
+                (str(row['reference_number']).strip(), float(row['amount']))
+            )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'message': f'Internal data uploaded: {len(df)} records'})
+        
+    except Exception as e:
+        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+
+@app.route('/api/upload/processor', methods=['POST'])
+def upload_processor():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    processor_name = request.form.get('processor_name', 'unknown')
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    try:
+        # Read the file
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file)
+        else:
+            return jsonify({'error': 'Only CSV files supported'}), 400
+        
+        # Validate required columns
+        if 'reference_number' not in df.columns or 'amount' not in df.columns:
+            return jsonify({'error': 'CSV must contain reference_number and amount columns'}), 400
+        
+        # Save to database
+        conn = sqlite3.connect('reconciliation.db')
+        for _, row in df.iterrows():
+            conn.execute(
+                'INSERT OR REPLACE INTO processor_transactions (processor_name, reference_number, amount) VALUES (?, ?, ?)',
+                (processor_name, str(row['reference_number']).strip(), float(row['amount']))
+            )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'message': f'{processor_name} data uploaded: {len(df)} records'})
+        
+    except Exception as e:
+        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+
+@app.route('/api/reconcile', methods=['POST'])
+def reconcile():
+    try:
+        conn = sqlite3.connect('reconciliation.db')
+        
+        # Get counts
+        internal_count = conn.execute('SELECT COUNT(*) FROM internal_transactions').fetchone()[0]
+        processor_count = conn.execute('SELECT COUNT(*) FROM processor_transactions').fetchone()[0]
+        
+        # Find matches (reference number + amount within 0.01 tolerance)
+        matches = conn.execute('''
+            SELECT 
+                it.reference_number,
+                it.amount as internal_amount,
+                pt.amount as processor_amount,
+                pt.processor_name
+            FROM internal_transactions it
+            JOIN processor_transactions pt ON it.reference_number = pt.reference_number
+            WHERE ABS(it.amount - pt.amount) < 0.01
+        ''').fetchall()
+        
+        conn.close()
+        
+        # Convert to list of dictionaries
+        match_list = []
+        for match in matches:
+            match_list.append({
+                'reference': match[0],
+                'internal_amount': match[1],
+                'processor_amount': match[2],
+                'processor': match[3]
+            })
+        
+        return jsonify({
+            'matches': match_list,
+            'summary': {
+                'internal_count': internal_count,
+                'processor_count': processor_count,
+                'match_count': len(match_list)
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'error': f'Reconciliation failed: {str(e)}'}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
